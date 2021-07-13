@@ -3,25 +3,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import random
 import time
-from collections import deque
 
 
 # ------------------------
 # Hyper parameter for DQN
 # ------------------------
 
-GAMMA = 0.9  # discount factor for target Q
-INITIAL_EPSILON = 0.5  # starting value of epsilon
-FINAL_EPSILON = 0.01  # final value of epsilon
-REPLAY_SIZE = 10000  # experience replay buffer size
-BATCH_SIZE = 32  # size of mini-batch
+GAMMA = 0.95  # discount factor for target Q
 ENV_NAME = 'CartPole-v0'
 EPISODE = 3000  # episode limitation
 STEP = 300  # step limitation in an episode
 TEST = 10  # the number of experiment test every 100 episode
-LR = 1e-4  # learning rate for training DQN
+LR = 1e-2  # learning rate for training DQN
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -37,7 +31,7 @@ class Net(nn.Module):
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
-        x = F.softmax(self.fc2(x))
+        x = F.softmax(self.fc2(x), dim=-1)
         return x
 
 
@@ -47,27 +41,26 @@ class Net(nn.Module):
 
 class ReplayMemory(object):
 
-    def __init__(self, capacity):
-        self.memory = deque(maxlen=capacity)
+    def __init__(self):
+        self.states = []
+        self.actions = []
+        self.rewards = []
 
     def push(self, state, action, reward):
-        """Save a transition"""
-        self.memory.append((state, action, reward))
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
 
-    def sample(self):
-        states = []
-        actions = []
-        rewards = []
-        for i, transition in enumerate(self.memory):
-            states[i] = transition[0]
-            actions[i] = transition[1]
-            rewards[i] = transition[2]
+    def pop_all(self):
+        return self.states, self.actions, self.rewards
 
-        self.memory.clear()
-        return states, actions, rewards
+    def clear(self):
+        self.states.clear()
+        self.actions.clear()
+        self.rewards.clear()
 
     def __len__(self):
-        return len(self.memory)
+        return len(self.states)
 
 
 # -------
@@ -76,48 +69,55 @@ class ReplayMemory(object):
 
 class Agent:
     def __init__(self, env):
-        self.replay_memory = ReplayMemory(REPLAY_SIZE)  # init experience replay
+        self.replay_memory = ReplayMemory()  # init experience replay
 
         # Init some parameters
-        self.time_step = 0
-        self.epsilon = INITIAL_EPSILON
         self.state_dim = env.observation_space.shape[0]
         self.action_dim = env.action_space.n
 
         # Init neural network
         self.policy_net = Net(self.state_dim, self.action_dim).to(DEVICE)
-        self.optimizer = torch.optim.AdamW(self.policy_net.parameters(), lr=LR)
+        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=LR)
 
     def select_action(self, state):
-        if np.random.rand() < self.epsilon:
-            action = np.random.randint(0, self.action_dim)  # select an action randomly
-        else:
-            with torch.no_grad():
-                state_tensor = torch.as_tensor(state, dtype=torch.float, device=DEVICE)
-                q_value = self.policy_net.forward(state_tensor)
-                action = torch.argmax(q_value).detach().item()  # select an action by Q network
-
-        self.epsilon -= (INITIAL_EPSILON - FINAL_EPSILON) / 10000  # epsilon decay
+        with torch.no_grad():
+            state_tensor = torch.as_tensor(state, dtype=torch.float, device=DEVICE)
+            action_prob = self.policy_net.forward(state_tensor).cpu().detach().numpy()
+            action = np.random.choice(range(self.action_dim), p=action_prob)  # select an action by Q network
         return action
 
     def update(self):
-        # Sample mini batch
-        transitions = self.replay_memory.sample()
+        # Sample a complete episode
+        states, actions, rewards = self.replay_memory.pop_all()
+        state_tensor = torch.as_tensor(states, dtype=torch.float, device=DEVICE)
+        action_tensor = torch.as_tensor(actions, device=DEVICE)
         
-        # Compute q value
-        q_value = self.policy_net.forward(state_batch).gather(1, action_batch)
-        next_q_value = self.policy_net.forward(next_state_batch).max(1)[0].detach() * (~done_batch)
-        expected_q_value = GAMMA * next_q_value + reward_batch
+        # Compute true value for each step
+        values = np.zeros(len(rewards))
+        value = 0
+        for t in reversed(range(0, len(rewards))):
+            value = GAMMA * value + rewards[t]
+            values[t] = value
 
-        # Compute Huber loss
-        criterion = nn.SmoothL1Loss()
-        loss = criterion(q_value, expected_q_value.unsqueeze(1))
+        values -= np.mean(values)
+        values /= np.std(values)
+        value_tensor = torch.as_tensor(values, device=DEVICE).detach()
+
+        # Compute estimated prob for each action
+        action_prob = self.policy_net.forward(state_tensor)
+
+        # Compute loss
+        loss = F.cross_entropy(action_prob, action_tensor, reduction='none')
+        loss = torch.sum(loss * value_tensor)
 
         # Optimize model parameters
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1)
         self.optimizer.step()
+
+        # Clear replay memory
+        self.replay_memory.clear()
 
         return loss
 
@@ -139,8 +139,7 @@ def main():
         step = 0
         while not done and step < STEP:
             action = agent.select_action(state)
-            next_state, reward_, done, _ = env.step(action)
-            reward = -1 if done else 0.1
+            next_state, reward, done, _ = env.step(action)
             agent.replay_memory.push(state, action, reward)
             state = next_state
             step += 1
@@ -151,7 +150,7 @@ def main():
         # Test every 100 episodes
         # ---------------------------
 
-        agent.policy_net.eval()
+        # agent.policy_net.eval()
         if episode % 100 == 0:
             total_reward = 0
             for i in range(TEST):
@@ -159,6 +158,7 @@ def main():
                 done = False
                 step = 0
                 while not done and step < STEP:
+                    # env.render()
                     with torch.no_grad():
                         action = agent.select_action(state)
                     next_state, reward, done, _ = env.step(action)

@@ -12,33 +12,38 @@ from collections import deque
 # Hyper parameter for DQN
 # ------------------------
 
-GAMMA = 0.9  # discount factor for target Q
-INITIAL_EPSILON = 0.5  # starting value of epsilon
-FINAL_EPSILON = 0.01  # final value of epsilon
+GAMMA = 0.95  # discount factor for target Q
 REPLAY_SIZE = 10000  # experience replay buffer size
 BATCH_SIZE = 32  # size of mini-batch
 ENV_NAME = 'CartPole-v0'
-EPISODE = 3000  # episode limitation
+EPISODE = 10000  # episode limitation
 STEP = 300  # step limitation in an episode
 TEST = 10  # the number of experiment test every 100 episode
 LR = 1e-4  # learning rate for training DQN
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-# -------------
-# Deep Q-network
-# -------------
+# ----------------------
+# Actor-critic network
+# ----------------------
 
-class DQN(nn.Module):
+class ACNet(nn.Module):
     def __init__(self, state_dim, action_dim):
-        super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_dim, 20)
-        self.fc2 = nn.Linear(20, action_dim)
+        super(ACNet, self).__init__()
+        self.afc1 = nn.Linear(state_dim, 20)  # fully connected layer 1 of actor net
+        self.afc2 = nn.Linear(20, action_dim)
+
+        self.cfc1 = nn.Linear(state_dim, 20)  # fully connected layer 1 of critic net
+        self.cfc2 = nn.Linear(20, action_dim)
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
+        pi = F.relu(self.afc1(x))
+        pi = self.afc2(pi)
+
+        value = F.relu(self.cfc1(x))
+        value = self.cfc2(value)
+
+        return pi, value
 
 
 # --------------
@@ -50,9 +55,9 @@ class ReplayMemory(object):
     def __init__(self, capacity):
         self.memory = deque(maxlen=capacity)
 
-    def push(self, state, action, reward, next_state, next_action, done):
+    def push(self, state, action, reward, next_state, done):
         """Save a transition"""
-        self.memory.append((state, action, reward, next_state, next_action, done))
+        self.memory.append((state, action, reward, next_state, done))
 
     def sample(self, batch_size):
         return random.sample(self.memory, batch_size)
@@ -71,24 +76,18 @@ class Agent:
 
         # Init some parameters
         self.time_step = 0
-        self.epsilon = INITIAL_EPSILON
         self.state_dim = env.observation_space.shape[0]
         self.action_dim = env.action_space.n
 
         # Init neural network
-        self.DQN = DQN(self.state_dim, self.action_dim).to(DEVICE)
-        self.optimizer = torch.optim.AdamW(self.DQN.parameters(), lr=LR)
+        self.ACNet = ACNet(self.state_dim, self.action_dim).to(DEVICE)
+        self.optimizer = torch.optim.AdamW(self.ACNet.parameters(), lr=LR)
 
     def select_action(self, state):
-        if np.random.rand() < self.epsilon:
-            action = np.random.randint(0, self.action_dim)  # select an action randomly
-        else:
-            with torch.no_grad():
-                state_tensor = torch.as_tensor(state, dtype=torch.float, device=DEVICE)
-                q_value = self.DQN.forward(state_tensor)
-                action = torch.argmax(q_value).detach().item()  # select an action by Q network
-
-        self.epsilon -= (INITIAL_EPSILON - FINAL_EPSILON) / 10000  # epsilon decay
+        with torch.no_grad():
+            state_tensor = torch.as_tensor(state, dtype=torch.float, device=DEVICE)
+            action_prob = F.softmax(self.ACNet.forward(state_tensor)[0], dim=-1).cpu().detach().numpy()
+            action = np.random.choice(range(self.action_dim), p=action_prob)  # select an action by Q network
         return action
 
     def update(self):
@@ -99,28 +98,42 @@ class Agent:
         transitions = self.replay_memory.sample(BATCH_SIZE)
 
         state_batch = torch.as_tensor([data[0] for data in transitions], dtype=torch.float, device=DEVICE)
-        action_batch = torch.as_tensor([data[1] for data in transitions], device=DEVICE).view(BATCH_SIZE, 1)
-        reward_batch = torch.as_tensor([data[2] for data in transitions], device=DEVICE).view(BATCH_SIZE, 1)
+        action_batch = torch.as_tensor([data[1] for data in transitions], device=DEVICE)
+        reward_batch = torch.as_tensor([data[2] for data in transitions], device=DEVICE)
         next_state_batch = torch.as_tensor([data[3] for data in transitions], dtype=torch.float, device=DEVICE)
-        next_action_batch = torch.as_tensor([data[4] for data in transitions], device=DEVICE).view(BATCH_SIZE, 1)
-        done_batch = torch.as_tensor([data[5] for data in transitions], device=DEVICE).view(BATCH_SIZE, 1)
+        done_batch = torch.as_tensor([data[4] for data in transitions], device=DEVICE)
+
+        # -------------------------
+        # Evaluate critic
+        # -------------------------
 
         # Compute q value
-        q_value = self.DQN.forward(state_batch).gather(1, action_batch)
-        next_q_value = self.DQN.forward(next_state_batch).gather(1, next_action_batch).detach() * (~done_batch)
+        q_value = self.ACNet.forward(state_batch)[1].gather(1, action_batch.view(BATCH_SIZE, 1))
+        next_q_value = self.ACNet.forward(next_state_batch)[1].max(1)[0].detach() * (~done_batch)
         expected_q_value = GAMMA * next_q_value + reward_batch
 
         # Compute Huber loss
-        criterion = nn.SmoothL1Loss()
-        loss = criterion(q_value, expected_q_value)
+        td_error = F.smooth_l1_loss(input=q_value, target=expected_q_value.unsqueeze(1), reduction='none')
+        critic_loss = torch.sum(td_error)
 
-        # Optimize model parameters
+        # -------------------------
+        # Evaluate actor
+        # -------------------------
+
+        action_prob = F.softmax(self.ACNet(state_batch)[0], dim=-1)
+        actor_loss = F.cross_entropy(action_prob, action_batch, reduction='none')
+        actor_loss = -torch.sum(actor_loss * td_error.detach())
+
+        total_loss = critic_loss + actor_loss
+
+        # -------------------------
+        # Optimize ACNet parameters
+        # -------------------------
+
         self.optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.DQN.parameters(), 1)
+        total_loss.backward()
+        nn.utils.clip_grad_norm_(self.ACNet.parameters(), 1)
         self.optimizer.step()
-
-        return loss
 
 
 def main():
@@ -138,38 +151,33 @@ def main():
 
         done = False
         step = 0
-        action = agent.select_action(state)
         while not done and step < STEP:
+            action = agent.select_action(state)
             next_state, reward_, done, _ = env.step(action)
             reward = -1 if done else 0.1
-            next_action = agent.select_action(next_state)
-            agent.replay_memory.push(state, action, reward, next_state, next_action, done)
+            agent.replay_memory.push(state, action, reward, next_state, done)
             agent.update()
             state = next_state
-            action = next_action
             step += 1
 
         # ---------------------------
         # Test every 100 episodes
         # ---------------------------
 
-        agent.DQN.eval()
+        agent.ACNet.eval()
         if episode % 100 == 0:
             total_reward = 0
             for i in range(TEST):
                 state = env.reset()
                 done = False
                 step = 0
-                with torch.no_grad():
-                    action = agent.select_action(state)
                 while not done and step < STEP:
-                    env.render()
-                    next_state, reward, done, _ = env.step(action)
+                    # env.render()
                     with torch.no_grad():
-                        next_action = agent.select_action(next_state)
+                        action = agent.select_action(state)
+                    next_state, reward, done, _ = env.step(action)
                     total_reward += reward
                     state = next_state
-                    action = next_action
                     step += 1
 
             ave_reward = total_reward / TEST

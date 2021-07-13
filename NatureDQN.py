@@ -77,10 +77,10 @@ class Agent:
         self.action_dim = env.action_space.n
 
         # Init neural network
-        self.policy_net = DQN(self.state_dim, self.action_dim).to(DEVICE)
+        self.current_net = DQN(self.state_dim, self.action_dim).to(DEVICE)
         self.target_net = DQN(self.state_dim, self.action_dim).to(DEVICE)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.optimizer = torch.optim.AdamW(self.policy_net.parameters(), lr=LR)
+        self.target_net.load_state_dict(self.current_net.state_dict())
+        self.optimizer = torch.optim.AdamW(self.current_net.parameters(), lr=LR)
 
     def select_action(self, state):
         if np.random.rand() < self.epsilon:
@@ -88,7 +88,7 @@ class Agent:
         else:
             with torch.no_grad():
                 state_tensor = torch.as_tensor(state, dtype=torch.float, device=DEVICE)
-                q_value = self.policy_net.forward(state_tensor)
+                q_value = self.current_net.forward(state_tensor)
                 action = torch.argmax(q_value).detach().item()  # select an action by Q network
 
         self.epsilon -= (INITIAL_EPSILON - FINAL_EPSILON) / 10000  # epsilon decay
@@ -108,7 +108,7 @@ class Agent:
         done_batch = torch.as_tensor([data[4] for data in transitions], device=DEVICE)
 
         # Compute q value
-        q_value = self.policy_net.forward(state_batch).gather(1, action_batch)
+        q_value = self.current_net.forward(state_batch).gather(1, action_batch)
         next_q_value = self.target_net.forward(next_state_batch).max(1)[0].detach() * (~done_batch)
         expected_q_value = GAMMA * next_q_value + reward_batch
 
@@ -119,7 +119,7 @@ class Agent:
         # Optimize model parameters
         self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1)
+        nn.utils.clip_grad_norm_(self.current_net.parameters(), 1)
         self.optimizer.step()
 
         return loss
@@ -151,13 +151,13 @@ def main():
 
         # synchronize target net to policy net
         if episode % TARGET_SYNC == 0:
-            agent.target_net.load_state_dict(agent.policy_net.state_dict())
+            agent.target_net.load_state_dict(agent.current_net.state_dict())
 
         # ---------------------------
         # Test every 100 episodes
         # ---------------------------
 
-        agent.policy_net.eval()
+        agent.current_net.eval()
         if episode % 100 == 0:
             total_reward = 0
             for i in range(TEST):
@@ -165,6 +165,7 @@ def main():
                 done = False
                 step = 0
                 while not done and step < STEP:
+                    # env.render()
                     with torch.no_grad():
                         action = agent.select_action(state)
                     next_state, reward, done, _ = env.step(action)

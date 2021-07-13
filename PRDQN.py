@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import time
-from collections import deque
 
 
 # ------------------------
@@ -242,6 +241,7 @@ def main():
                 done = False
                 step = 0
                 while not done and step < STEP:
+                    env.render()
                     with torch.no_grad():
                         action = agent.select_action(state)
                     next_state, reward, done, _ = env.step(action)
