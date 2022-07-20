@@ -12,11 +12,11 @@ import time
 
 GAMMA = 0.95  # discount factor for target Q
 ENV_NAME = 'CartPole-v0'
-EPISODE = 1000  # episode limitation
+EPISODE = 3000  # episode limitation
 STEP = 300  # step limitation in an episode
 TEST = 100  # the number of experiment test every 100 episode
-A_LR = 1e-3  # learning rate for actor
-C_LR = 1e-3  # learning rate for critic
+A_LR = 1e-4  # learning rate for actor
+C_LR = 1e-4  # learning rate for critic
 BATCH_SIZE = 32  # update parameters every 32 steps
 EPS_CLIP = 0.2  # clip surrogate loss
 UPDATE_EPOCH = 10
