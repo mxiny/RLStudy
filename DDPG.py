@@ -12,42 +12,46 @@ from collections import deque
 # Hyper parameter for DQN
 # ------------------------
 
-GAMMA = 0.95  # discount factor for target Q
-TAU = 0.1 # update target network parameters 
-REPLAY_SIZE = 3000  # experience replay buffer size
+GAMMA = 0.9  # discount factor for target Q
+TAU = 0.01 # update target network parameters 
+REPLAY_SIZE = 10000  # experience replay buffer size
 BATCH_SIZE = 32  # size of mini-batch
 ENV_NAME = 'Pendulum-v1'
-EPISODE = 10000  # episode limitation
-STEP = 300  # step limitation in an episode
+EPISODE = 2000  # episode limitation
+STEP = 200  # step limitation in an episode
 TEST = 10  # the number of experiment test every 100 episode
-LR = 1e-4  # learning rate for training DQN
+LR = 1e-3  # learning rate for training AC network
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 TARGET_SYNC = 10  # Synchronize the target net parameter every 10 episodes
+VAR = 3 # variance of exploration noise
 
 
 # ----------------------
 # Actor-critic network
 # ----------------------
 
-class ACNet(nn.Module):
+class Actor(nn.Module):
     def __init__(self, state_dim, action_dim):
-        super(ACNet, self).__init__()
-        self.actor = nn.Sequential(
-            nn.Linear(state_dim, 20),
-            nn.ReLU(),
-            nn.Linear(20, action_dim),
-            nn.Softmax(dim=-1)
-        )
+        super(Actor, self).__init__()
+        self.fc1 = nn.Linear(state_dim, 30)
+        self.fc2 = nn.Linear(30, action_dim)
 
-        self.critic = nn.Sequential(
-            nn.Linear(state_dim + action_dim, 20),
-            nn.ReLU(),
-            nn.Linear(20, 1)
-        )
+    def forward(self, state):
+        action = F.relu(self.fc1(state))
+        action = torch.tanh(self.fc2(action)) * 2
+        return action
 
-    def forward(self, x):
-        raise NotImplementedError
+class Critic(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(Critic, self).__init__()
+        self.fc11 = nn.Linear(state_dim, 30)
+        self.fc12 = nn.Linear(action_dim, 30)
+        self.fc2 = nn.Linear(30, 1)
 
+    def forward(self, state, action):
+        value = F.relu(self.fc11(state) + self.fc12(action))
+        value = self.fc2(value)
+        return value
 
 # --------------
 # Replay memory
@@ -78,77 +82,88 @@ class Agent:
         self.replay_memory = ReplayMemory(REPLAY_SIZE)  # init experience replay
 
         # Init some parameters
-        self.time_step = 0
         self.state_dim = env.observation_space.shape[0]
         self.action_dim = env.action_space.shape[0]
-        self.a_bound = env.action_space.high
 
         # Init neural network
-        self.current_net = ACNet(self.state_dim, self.action_dim).to(DEVICE)
-        self.optimizer = torch.optim.Adam(self.current_net.parameters(), lr=LR)
+        self.current_actor = Actor(self.state_dim, self.action_dim).to(DEVICE)
+        self.current_critic = Critic(self.state_dim, self.action_dim).to(DEVICE)
+        self.target_actor = Actor(self.state_dim, self.action_dim).to(DEVICE)
+        self.target_critic = Critic(self.state_dim, self.action_dim).to(DEVICE)
 
-        self.target_net = ACNet(self.state_dim, self.action_dim).to(DEVICE)
-        self.target_net.load_state_dict(self.current_net.state_dict())
+        self.target_actor.load_state_dict(self.current_actor.state_dict())
+        self.target_critic.load_state_dict(self.current_critic.state_dict())
+
+        self.actor_optim = torch.optim.Adam(self.current_actor.parameters(), lr=LR)
+        self.critic_optim = torch.optim.Adam(self.current_critic.parameters(), lr=LR)
 
     def select_action(self, state):
         with torch.no_grad():
             state_tensor = torch.as_tensor(state, dtype=torch.float, device=DEVICE)
-            action = self.current_net.actor(state_tensor).cpu().detach().numpy() # select an action by Q network
-            action = action * self.a_bound + np.random.randn(self.action_dim) # add exploration noise
+            action = self.current_actor(state_tensor).cpu().detach().numpy() # select an action by Q network
+            action = np.clip(np.random.normal(action, VAR), -2, 2) # add exploration noise
         return action
 
     def update(self):
         if len(self.replay_memory) < REPLAY_SIZE:
             return
 
+        # synchronize target net to current net
+        self.synchronize_networks()
+
         # Sample mini batch
         transitions = self.replay_memory.sample(BATCH_SIZE)
 
-        state_batch = torch.as_tensor([data[0] for data in transitions], dtype=torch.float, device=DEVICE)
-        action_batch = torch.as_tensor([data[1] for data in transitions], device=DEVICE)
-        reward_batch = torch.as_tensor([data[2] for data in transitions], device=DEVICE).view(BATCH_SIZE, 1)
-        next_state_batch = torch.as_tensor([data[3] for data in transitions], dtype=torch.float, device=DEVICE)
-        done_batch = torch.as_tensor([data[4] for data in transitions], device=DEVICE).view(BATCH_SIZE, 1)
-        state_action_batch = torch.as_tensor([np.concatenate([data[0], data[1]]) for data in transitions], dtype=torch.float, device=DEVICE)
-
+        states = torch.as_tensor([data[0] for data in transitions], dtype=torch.float, device=DEVICE)
+        actions = torch.as_tensor([data[1] for data in transitions], dtype=torch.float, device=DEVICE)
+        rewards = torch.as_tensor([data[2] for data in transitions], dtype=torch.float, device=DEVICE).view(BATCH_SIZE, 1)
+        next_states = torch.as_tensor([data[3] for data in transitions], dtype=torch.float, device=DEVICE)
+        dones = torch.as_tensor([data[4] for data in transitions], device=DEVICE).view(BATCH_SIZE, 1)
+        
         # -------------------------
         # Evaluate critic
         # -------------------------
 
         # Compute q value
-        q_value = self.current_net.critic(state_action_batch)
-        next_action = self.target_net.actor(next_state_batch)
-        next_state_action_batch = torch.as_tensor([np.concatenate([s.detach().numpy(), a.detach().numpy()]) for s, a in zip(next_state_batch, next_action)], dtype=torch.float, device=DEVICE)
-        next_q_value = self.target_net.critic(next_state_action_batch).detach() * (~done_batch)
-        expected_q_value = GAMMA * next_q_value + reward_batch
+        q_value = self.current_critic(states, actions)
+        next_actions = self.target_actor(next_states)
+        next_q_value = self.target_critic(next_states, next_actions).detach() * (~dones)
+        expected_q_value = GAMMA * next_q_value + rewards
 
         # Compute square error loss
         td_error = expected_q_value - q_value
         critic_loss = torch.sum(torch.square(td_error))
 
         # -------------------------
+        # Optimize Critic parameters
+        # -------------------------
+
+        self.critic_optim.zero_grad()
+        critic_loss.backward()
+        nn.utils.clip_grad_norm_(self.current_critic.parameters(), 1)
+        self.critic_optim.step()
+
+        # -------------------------
         # Evaluate actor
         # -------------------------
-
-        action = self.current_net.actor(state_batch)
-        state_action_batch = torch.as_tensor([np.concatenate([s.detach().numpy(), a.detach().numpy()]) for s, a in zip(state_batch, action)], dtype=torch.float, device=DEVICE)
-        # Cross entropy returns negative log likelihood loss
-        actor_loss = -torch.mean(self.current_net.critic(state_action_batch))
-
-        total_loss = critic_loss + actor_loss
+        est_actions = self.current_actor(states)
+        actor_loss = -torch.mean(self.current_critic(states, est_actions))
 
         # -------------------------
-        # Optimize ACNet parameters
+        # Optimize Actor parameters
         # -------------------------
 
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        nn.utils.clip_grad_norm_(self.current_net.parameters(), 1)
-        self.optimizer.step()
+        self.actor_optim.zero_grad()
+        actor_loss.backward()
+        nn.utils.clip_grad_norm_(self.current_actor.parameters(), 1)
+        self.actor_optim.step()
     
     def synchronize_networks(self):
-        for curr, target in zip(self.current_net.parameters(), self.target_net.parameters()):
-            target = (1 - TAU) * target + TAU * curr
+        for curr, target in zip(self.current_actor.parameters(), self.target_actor.parameters()):
+            target.data.copy_((1 - TAU) * target.data + TAU * curr.data)
+            
+        for curr, target in zip(self.current_critic.parameters(), self.target_critic.parameters()):
+            target.data.copy_((1 - TAU) * target.data + TAU * curr.data)
 
 
 def main():
@@ -169,21 +184,19 @@ def main():
         while not done and step < STEP:
             action = agent.select_action(state)
             next_state, reward, done, _ = env.step(action)
-            # reward = -1 if done else 0.1
-            agent.replay_memory.push(state, action, reward, next_state, done)
+            agent.replay_memory.push(state, action, reward / 10, next_state, done)
             agent.update()
             state = next_state
             step += 1
-
-        # synchronize target net to current net
-        if episode % TARGET_SYNC == 0:
-            agent.synchronize_networks()
         
+        if len(agent.replay_memory) > REPLAY_SIZE:
+            VAR *= 0.9995
         # ---------------------------
         # Test every 100 episodes
         # ---------------------------
 
-        agent.current_net.eval()
+        agent.current_actor.eval()
+        agent.current_critic.eval()
         if episode % 100 == 0:
             total_reward = 0
             for i in range(TEST):
