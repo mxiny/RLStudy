@@ -16,15 +16,13 @@ GAMMA = 0.9  # discount factor for target Q
 TAU = 0.01 # update target network parameters 
 REPLAY_SIZE = 10000  # experience replay buffer size
 BATCH_SIZE = 32  # size of mini-batch
-ENV_NAME = 'Pendulum-v1'
-EPISODE = 2000  # episode limitation
+ENV_NAME = 'Pendulum-v0'
+EPISODE = 500  # episode limitation
 STEP = 200  # step limitation in an episode
 TEST = 10  # the number of experiment test every 100 episode
-LR = 1e-3  # learning rate for training AC network
+LR_A = 1e-3  # learning rate for training Actor network
+LR_C = 2e-3  # learning rate for training Critic network
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-TARGET_SYNC = 10  # Synchronize the target net parameter every 10 episodes
-VAR = 3 # variance of exploration noise
-
 
 # ----------------------
 # Actor-critic network
@@ -33,8 +31,8 @@ VAR = 3 # variance of exploration noise
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(Actor, self).__init__()
-        self.fc1 = nn.Linear(state_dim, 30)
-        self.fc2 = nn.Linear(30, action_dim)
+        self.fc1 = nn.Linear(state_dim, 20)
+        self.fc2 = nn.Linear(20, action_dim)
 
     def forward(self, state):
         action = F.relu(self.fc1(state))
@@ -44,9 +42,9 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(Critic, self).__init__()
-        self.fc11 = nn.Linear(state_dim, 30)
-        self.fc12 = nn.Linear(action_dim, 30)
-        self.fc2 = nn.Linear(30, 1)
+        self.fc11 = nn.Linear(state_dim, 20)
+        self.fc12 = nn.Linear(action_dim, 20)
+        self.fc2 = nn.Linear(20, 1)
 
     def forward(self, state, action):
         value = F.relu(self.fc11(state) + self.fc12(action))
@@ -94,14 +92,16 @@ class Agent:
         self.target_actor.load_state_dict(self.current_actor.state_dict())
         self.target_critic.load_state_dict(self.current_critic.state_dict())
 
-        self.actor_optim = torch.optim.Adam(self.current_actor.parameters(), lr=LR)
-        self.critic_optim = torch.optim.Adam(self.current_critic.parameters(), lr=LR)
+        self.actor_optim = torch.optim.Adam(self.current_actor.parameters(), lr=LR_A)
+        self.critic_optim = torch.optim.Adam(self.current_critic.parameters(), lr=LR_C)
+        
+        self.var = 3 # variance of exploration noise
 
     def select_action(self, state):
         with torch.no_grad():
             state_tensor = torch.as_tensor(state, dtype=torch.float, device=DEVICE)
             action = self.current_actor(state_tensor).cpu().detach().numpy() # select an action by Q network
-            action = np.clip(np.random.normal(action, VAR), -2, 2) # add exploration noise
+            action = np.clip(np.random.normal(action, self.var), -2, 2) # add exploration noise
         return action
 
     def update(self):
@@ -114,16 +114,15 @@ class Agent:
         # Sample mini batch
         transitions = self.replay_memory.sample(BATCH_SIZE)
 
-        states = torch.as_tensor([data[0] for data in transitions], dtype=torch.float, device=DEVICE)
-        actions = torch.as_tensor([data[1] for data in transitions], dtype=torch.float, device=DEVICE)
-        rewards = torch.as_tensor([data[2] for data in transitions], dtype=torch.float, device=DEVICE).view(BATCH_SIZE, 1)
-        next_states = torch.as_tensor([data[3] for data in transitions], dtype=torch.float, device=DEVICE)
-        dones = torch.as_tensor([data[4] for data in transitions], device=DEVICE).view(BATCH_SIZE, 1)
+        states = torch.as_tensor(np.array([data[0] for data in transitions]), dtype=torch.float, device=DEVICE)
+        actions = torch.as_tensor(np.array([data[1] for data in transitions]), dtype=torch.float, device=DEVICE)
+        rewards = torch.as_tensor(np.array([data[2] for data in transitions]), dtype=torch.float, device=DEVICE).view(BATCH_SIZE, 1)
+        next_states = torch.as_tensor(np.array([data[3] for data in transitions]), dtype=torch.float, device=DEVICE)
+        dones = torch.as_tensor(np.array([data[4] for data in transitions]), device=DEVICE).view(BATCH_SIZE, 1)
         
         # -------------------------
         # Evaluate critic
         # -------------------------
-
         # Compute q value
         q_value = self.current_critic(states, actions)
         next_actions = self.target_actor(next_states)
@@ -137,7 +136,6 @@ class Agent:
         # -------------------------
         # Optimize Critic parameters
         # -------------------------
-
         self.critic_optim.zero_grad()
         critic_loss.backward()
         nn.utils.clip_grad_norm_(self.current_critic.parameters(), 1)
@@ -152,7 +150,6 @@ class Agent:
         # -------------------------
         # Optimize Actor parameters
         # -------------------------
-
         self.actor_optim.zero_grad()
         actor_loss.backward()
         nn.utils.clip_grad_norm_(self.current_actor.parameters(), 1)
@@ -185,19 +182,21 @@ def main():
             action = agent.select_action(state)
             next_state, reward, done, _ = env.step(action)
             agent.replay_memory.push(state, action, reward / 10, next_state, done)
+            
+            if len(agent.replay_memory) == REPLAY_SIZE:
+                agent.var *= 0.9995
+            
             agent.update()
             state = next_state
             step += 1
         
-        if len(agent.replay_memory) > REPLAY_SIZE:
-            VAR *= 0.9995
         # ---------------------------
-        # Test every 100 episodes
+        # Test every 10 episodes
         # ---------------------------
 
         agent.current_actor.eval()
         agent.current_critic.eval()
-        if episode % 100 == 0:
+        if episode % 10 == 0:
             total_reward = 0
             for i in range(TEST):
                 state = env.reset()
@@ -213,7 +212,7 @@ def main():
                     step += 1
 
             ave_reward = total_reward / TEST
-            print('Episode:', episode, 'Evaluation average reward:', ave_reward)
+            print('Episode:', episode, 'Evaluation average reward:', ave_reward, 'Var:', agent.var)
 
     print('Time cost: ', time.time() - start_time)
 
